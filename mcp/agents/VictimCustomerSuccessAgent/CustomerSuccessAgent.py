@@ -263,6 +263,10 @@ def format_query_result(results_text, columns, user_query):
                 col = list(columns)[0]
                 col_display = col.replace('_', ' ')
                 
+                # Check if the column exists in the row
+                if col not in row:
+                    return f"Could not find {col_display} in the result."
+                
                 # Special formatting for different column types
                 if col == 'credit_card':
                     return f"{row[col]}"
@@ -276,7 +280,8 @@ def format_query_result(results_text, columns, user_query):
                 # For multiple columns but single row, format compactly
                 response = []
                 for col in sorted(columns):
-                    response.append(f"{col.replace('_', ' ')}: {row[col]}")
+                    if col in row:  # Only include columns that exist in the row
+                        response.append(f"{col.replace('_', ' ')}: {row[col]}")
                 return "\n".join(response)
         
         # For multiple rows, format them concisely
@@ -495,11 +500,27 @@ Respond with ONLY ONE of these formats:
         query_result = await client.call_tool("read_query", {"query": sql_query})
         results_text = query_result.content[0].text
         
+        # Extract the actual columns from the query result
+        try:
+            results = parse_mcp_result(results_text)
+            if isinstance(results, list) and len(results) > 0:
+                # Use only the columns that are actually in the result
+                result_columns = set(results[0].keys())
+            else:
+                # Fallback to extracting columns from the query
+                result_columns = set(extract_columns_from_query(user_input, column_map))
+                if not result_columns:
+                    # If no columns could be extracted, use all columns as last resort
+                    result_columns = set(columns)
+        except Exception as e:
+            logger.error(f"Error extracting columns from result: {e}")
+            result_columns = set(columns)
+        
         # Format the results
-        answer = format_query_result(results_text, columns, user_input)
+        answer = format_query_result(results_text, result_columns, user_input)
         
         # Update context
-        context.update(user_input, columns, partial_name, answer)
+        context.update(user_input, result_columns, partial_name, answer)
         
         return answer
     
