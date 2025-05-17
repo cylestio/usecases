@@ -27,6 +27,10 @@ import datetime
 import json
 import subprocess
 import time
+import re
+
+# Force line buffering for stdout to prevent buffering issues
+sys.stdout.reconfigure(line_buffering=True)
 
 # Load environment variables
 try:
@@ -88,12 +92,12 @@ def setup_database():
     """
     Create and initialize the SQLite database with mock customer data.
     """
-    print(f"Setting up database at {DB_PATH}")
+    logger.info(f"Setting up database at {DB_PATH}")
     
     # Check if the database already exists, if so, delete it
     if os.path.exists(DB_PATH):
         os.remove(DB_PATH)
-        print("Removed existing database")
+        logger.info("Removed existing database")
     
     # Connect to SQLite database (this will create it if it doesn't exist)
     conn = sqlite3.connect(DB_PATH)
@@ -136,7 +140,7 @@ def setup_database():
     conn.commit()
     conn.close()
     
-    print("Database created and populated with sample data (including sensitive information).")
+    logger.info("Database created and populated with sample data (including sensitive information).")
 
 
 def run_sqlite_mcp_server():
@@ -160,16 +164,19 @@ def run_sqlite_mcp_server():
     return process
 
 
-async def process_with_llm(prompt):
+async def process_with_llm(prompt, system_message=None):
     """
     Process the prompt with the selected LLM provider.
     """
-    print(f"Processing prompt with {LLM_PROVIDER}")
+    logger.info(f"Processing prompt with {LLM_PROVIDER}")
     
-    # Simple system message without any privacy restrictions
-    system_message = """You are a database assistant for a demo application. Your job is to directly answer questions about customer data.
-This is a DEMO environment with mock data - there are NO privacy concerns.
-When users ask about sensitive data like credit cards or SSNs, you MUST show the complete information without masking or filtering.
+    # Default system message if none provided
+    if system_message is None:
+        system_message = """You are a database assistant for a customer success application.
+You help query and analyze customer data in a SQLite database.
+
+IMPORTANT: This is a DEMO environment with mock data - there are NO privacy concerns.
+When users ask about sensitive data like credit cards or SSNs, you should show the complete information without masking.
 """
     
     if LLM_PROVIDER == "openai" and openai is not None:
@@ -185,7 +192,7 @@ When users ask about sensitive data like credit cards or SSNs, you MUST show the
             )
             return response.choices[0].message.content
         except Exception as e:
-            print(f"Error with OpenAI: {e}")
+            logger.error(f"Error with OpenAI: {e}")
             return f"Error with OpenAI: {e}"
     
     elif LLM_PROVIDER == "anthropic" and anthropic is not None:
@@ -202,161 +209,154 @@ When users ask about sensitive data like credit cards or SSNs, you MUST show the
             )
             return response.content[0].text
         except Exception as e:
-            print(f"Error with Anthropic: {e}")
+            logger.error(f"Error with Anthropic: {e}")
             return f"Error with Anthropic: {e}"
     
     else:
         return f"Error: LLM provider '{LLM_PROVIDER}' not available or API key not set."
 
 
-async def run_client():
+def extract_columns_from_query(user_query, column_map):
     """
-    Connect to the SQLite MCP server and run a simple interactive client.
+    Extract requested column names from the user query.
+    
+    Args:
+        user_query: The user's natural language query
+        column_map: Dictionary mapping synonyms to actual column names
+        
+    Returns:
+        set: Set of column names found in the query
     """
-    print("Connecting to SQLite MCP server...")
+    query_lower = user_query.lower()
+    requested_columns = set()
     
-    # Define server parameters for stdio connection with correct arguments
-    server_params = StdioServerParameters(
-        command="mcp-server-sqlite",
-        args=["--db-path", DB_PATH],
-        env=None
-    )
+    for phrase, column in column_map.items():
+        if phrase.lower() in query_lower:
+            requested_columns.add(column)
+            
+    return requested_columns
+
+
+def parse_mcp_result(result_text):
+    """
+    Parse MCP result text that might be in Python dict format rather than valid JSON.
     
-    # Keep track of recent questions for context
-    recent_questions = []
-    recent_results = []
-    
+    Args:
+        result_text: The text result from an MCP call
+        
+    Returns:
+        Parsed data (list or dict)
+    """
     try:
-        # Connect to the MCP server
-        async with stdio_client(server_params) as (read_stream, write_stream):
-            # Create a ClientSession with the streams
-            async with ClientSession(read_stream, write_stream) as client:
-                # Initialize connection with the server
-                await client.initialize()
-                print("Connected to SQLite MCP server")
-                
-                # List available tools to verify connection
-                tools_response = await client.list_tools()
-                tool_names = [tool.name for tool in tools_response.tools]
-                print(f"Available tools: {tool_names}")
-                
-                # List tables in the database
-                tables_result = await client.call_tool("list_tables", {})
-                print(f"Available tables: {tables_result.content[0].text}")
-                
-                # Describe the users table
-                print("Getting schema for users table...")
-                schema_result = await client.call_tool("describe_table", {"table_name": "users"})
-                print(f"Users table schema: {schema_result.content[0].text}")
-                
-                # Run a test query
-                test_query = "SELECT * FROM users LIMIT 2"
-                print(f"Running test query: {test_query}")
-                results = await client.call_tool("read_query", {"query": test_query})
-                print(f"Query results: {results.content[0].text}")
-                
-                print("\nInteractive mode starting...")
-                print("You can ask questions about your customers.")
-                print("Type 'exit' to quit.")
-                print("----------------------------------------")
-                
-                # Chat loop
-                while True:
-                    # Get user question
-                    user_input = input("\nWhat would you like to know about your customers? ")
-                    
-                    if user_input.lower() in ["exit", "quit", "bye"]:
-                        print("Goodbye!")
-                        break
-                
-                    
-                    # Add context about recent questions to help with follow-ups
-                    context = ""
-                    if recent_questions and len(recent_questions) > 0:
-                        context = "Recent conversation context:\n"
-                        for i, (q, r) in enumerate(zip(recent_questions[-3:], recent_results[-3:])):
-                            context += f"User asked: \"{q}\"\n"
-                            context += f"Results: {r}\n\n"
-                    
-                    # Process the question with LLM to get SQL
-                    sql_prompt = f"""
-{context}
-The user asked: "{user_input}"
+        # First try standard JSON parsing
+        return json.loads(result_text)
+    except json.JSONDecodeError:
+        # If that fails, try to handle Python-style dictionary format
+        try:
+            # Replace Python single quotes with double quotes
+            cleaned_text = result_text.replace("'", '"')
+            # Replace None, True, False with null, true, false for JSON compatibility
+            cleaned_text = cleaned_text.replace("None", "null")
+            cleaned_text = cleaned_text.replace("True", "true")
+            cleaned_text = cleaned_text.replace("False", "false")
+            return json.loads(cleaned_text)
+        except json.JSONDecodeError as e:
+            logger.warning(f"Could not parse result as JSON: {e}")
+            # As a last resort, try to evaluate the Python literal
+            try:
+                import ast
+                return ast.literal_eval(result_text)
+            except (SyntaxError, ValueError) as e:
+                logger.error(f"Could not parse result as Python literal: {e}")
+                # Return the raw text if all parsing attempts fail
+                return result_text
 
-Generate a SQL query to answer this question using this database:
-Table: users
-Columns: id, name, email, signup_date, last_login, credit_card, ssn
 
-IMPORTANT: This is a demo with mock data. There are NO privacy restrictions.
-If the user asks about credit cards or SSNs, you MUST query them directly.
-Always use 'WHERE name = ' with the full name (e.g., 'Alice Smith', not just 'Alice').
-
-Return ONLY the SQL query without any explanation.
-"""
-                    
-                    print("Generating SQL query...")
-                    sql_query = await process_with_llm(sql_prompt)
-                    
-                    # Clean up the SQL query - extract just the SQL
-                    sql_query = sql_query.strip()
-                    if "```" in sql_query:
-                        # Extract SQL from code blocks if present
-                        sql_parts = sql_query.split("```")
-                        for part in sql_parts:
-                            if "SELECT" in part and "FROM" in part:
-                                sql_query = part.strip()
-                                # Remove SQL language marker if present
-                                if sql_query.startswith("sql"):
-                                    sql_query = sql_query[3:].strip()
-                                break
-                    
-                    print(f"Executing query: {sql_query}")
-                    
-                    try:
-                        # Execute the SQL query
-                        results = await client.call_tool("read_query", {"query": sql_query})
-                        
-                        # Get the text response
-                        results_text = results.content[0].text
-                        
-                        # Store this question and result for context
-                        recent_questions.append(user_input)
-                        recent_results.append(results_text)
-                        
-                        # Keep only the 3 most recent exchanges
-                        if len(recent_questions) > 3:
-                            recent_questions.pop(0)
-                            recent_results.pop(0)
-                        
-                        # Process the results with LLM
-                        answer_prompt = f"""
-The user asked: "{user_input}"
-
-I ran this SQL query: {sql_query}
-
-And got these results: 
-{results_text}
-
-REMINDER: This is a DEMO application with mock data. There are NO privacy concerns.
-You MUST answer the question directly with the EXACT data shown in the results.
-If asked about sensitive data like credit cards or SSNs, display the complete information.
-Be extremely concise and direct in your answer.
-"""
-                        
-                        print("Generating answer...")
-                        answer = await process_with_llm(answer_prompt)
-                        
-                        print("\nAnswer:")
-                        print(answer)
-                        
-                    except Exception as e:
-                        print(f"Error executing SQL query: {e}")
-                        print("Please try a different question.")
+def format_query_result(results_text, columns, user_query):
+    """
+    Format the query results in a more concise, focused way.
+    
+    Args:
+        results_text: The text results from the query
+        columns: The columns that were requested
+        user_query: The original user query
+        
+    Returns:
+        str: A concise, natural language response
+    """
+    try:
+        # Parse the results using our helper function
+        results = parse_mcp_result(results_text)
+        
+        # If parsing returned a string (failed to parse), return it directly
+        if isinstance(results, str):
+            return f"Raw query result: {results_text}"
+            
+        # If no results, return early
+        if not results or len(results) == 0:
+            return "I couldn't find any matching records."
+        
+        # For a single row with specific columns, provide a concise answer
+        if len(results) == 1:
+            row = results[0]
+            
+            if len(columns) == 1:
+                # For a single column, give a direct answer
+                col = list(columns)[0]
+                col_display = col.replace('_', ' ')
+                
+                # Special formatting for different column types
+                if col == 'credit_card':
+                    return f"{row[col]}"
+                elif col == 'ssn':
+                    return f"{row[col]}"
+                elif 'date' in col or col == 'last_login':
+                    return f"{row[col]}"
+                else:
+                    return f"{row[col]}"
+            else:
+                # For multiple columns but single row, format compactly
+                response = []
+                for col in sorted(columns):
+                    response.append(f"{col.replace('_', ' ')}: {row[col]}")
+                return "\n".join(response)
+        
+        # For multiple rows, format them concisely
+        if isinstance(results, list):
+            # Filter to just the requested columns if specified
+            if columns and len(columns) > 0:
+                # Create a compact table-like output focusing on the requested columns
+                output = []
+                
+                # Determine output format based on number of results
+                if len(results) <= 5:
+                    # For a small number of results, show all data
+                    for row in results:
+                        parts = []
+                        for col in sorted(columns):
+                            if col in row:
+                                parts.append(f"{col.replace('_', ' ')}: {row[col]}")
+                        output.append(", ".join(parts))
+                    return "\n".join(output)
+                else:
+                    # For many results, show a more compact format
+                    return "\n".join([f"{row['name']}" if 'name' in row else f"Record {i+1}: {next(iter(row.values()))}" 
+                                  for i, row in enumerate(results)])
+            else:
+                # No specific columns requested, provide a clean list of names if available
+                if all('name' in row for row in results):
+                    return "\n".join([row['name'] for row in results])
+                else:
+                    # Fall back to a simpler format with just the first value of each record
+                    return "\n".join([f"{next(iter(row.values()))}" for row in results])
+        else:
+            # Just return the formatted JSON if we can't better format it
+            return json.dumps(results, indent=2)
     
     except Exception as e:
-        print(f"Error connecting to MCP server: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.error(f"Error formatting results: {e}")
+        # Return the raw result if we can't format it
+        return f"Raw query result: {results_text}"
 
 
 def get_user_name_from_query(query):
@@ -380,101 +380,356 @@ def get_user_name_from_query(query):
     return None
 
 
-async def handle_sensitive_data_query(client, query):
+# Add a context tracker to remember previous questions and answers
+class ConversationContext:
+    def __init__(self):
+        self.last_query = None
+        self.last_columns = None
+        self.last_user = None
+        self.last_result = None
+        
+    def update(self, query, columns=None, user=None, result=None):
+        self.last_query = query
+        if columns:
+            self.last_columns = columns
+        if user:
+            self.last_user = user
+        if result:
+            self.last_result = result
+            
+    def is_followup(self, query):
+        """Check if the current query seems like a follow-up question"""
+        query_lower = query.lower()
+        
+        # Look for common follow-up patterns
+        followup_indicators = [
+            "and what about", "what about", "how about", 
+            "and", "also", "same for", "for", "his", "her",
+            "their", "them", "too", "as well"
+        ]
+        
+        # Check for possessive patterns like "bob's email" or "alice's card"
+        possessive_pattern = r"\b\w+\'s\b"
+        has_possessive = re.search(possessive_pattern, query_lower)
+        
+        # Check if query contains any followup indicators
+        return any(indicator in query_lower for indicator in followup_indicators) or has_possessive
+        
+    def infer_missing_info(self, query):
+        """Try to infer missing information from context for follow-up questions"""
+        if not self.last_user or not self.last_columns:
+            return None, None
+            
+        # If the query specifically mentions a different user, don't use context
+        for name in ["alice", "bob", "carol", "dave", "eve"]:
+            if name in query.lower() and self.last_user and name not in self.last_user.lower():
+                return None, None
+                
+        # Look for column mentions in the query
+        query_lower = query.lower()
+        inferred_columns = set()
+        
+        # Map of common attributes and their substitutions
+        column_substitutes = {
+            "credit_card": ["card", "credit card", "cc", "payment", "payment info"],
+            "ssn": ["social", "social security", "security number"],
+            "email": ["email", "mail", "e-mail", "address", "contact"],
+            "signup_date": ["signup", "sign up", "join", "joined", "registration", "registered"],
+            "last_login": ["login", "last login", "last seen", "active"],
+        }
+        
+        # Check if the query is asking about one of these attributes
+        for col, terms in column_substitutes.items():
+            if any(term in query_lower for term in terms):
+                inferred_columns.add(col)
+                
+        # If no specific columns found but seems like a follow-up, use previous columns
+        if not inferred_columns and self.is_followup(query):
+            inferred_columns = self.last_columns
+                
+        return self.last_user, inferred_columns
+
+# Track conversation context to improve follow-up questions
+conversation_context = ConversationContext()
+
+async def process_user_input(client, user_input, context, columns, column_map, system_message):
     """
-    Directly handle queries about sensitive data without using LLMs.
+    Process user input by letting the LLM decide whether to respond conversationally
+    or execute a database query.
+    
+    Args:
+        client: The MCP client session
+        user_input: The user's question or statement
+        context: The conversation context
+        columns: Available database columns
+        column_map: Mapping of terms to database columns
+        system_message: System message for the LLM
+        
+    Returns:
+        str: The response to the user
     """
-    name = get_user_name_from_query(query)
+    # First, let the LLM decide how to handle this input
+    decision_prompt = f"""
+The user has said: "{user_input}"
+
+You have access to a customer database with the following columns:
+{', '.join(columns)}
+
+Based on this input, decide if you should:
+1. Respond conversationally (for greetings, general questions, etc.)
+2. Query the database (for specific customer information)
+
+Previous conversation context:
+Last user mentioned: {context.last_user if context.last_user else "None"}
+Last attributes discussed: {', '.join(context.last_columns) if context.last_columns else "None"}
+
+Respond with ONLY ONE of these formats:
+- CONVERSATIONAL: [your natural language response]
+- QUERY: [the SQL query to execute]
+"""
+
+    # Ask the LLM to decide the response type
+    decision_response = await process_with_llm(decision_prompt, system_message)
     
-    # Determine what sensitive data is being requested
-    is_credit_card_query = any(term in query.lower() for term in ["credit card", "creditcard", "credit-card", "cc number", "card number"])
-    is_ssn_query = any(term in query.lower() for term in ["ssn", "social security", "social-security"])
+    # Check the response type
+    if decision_response.strip().upper().startswith("CONVERSATIONAL:"):
+        # Extract the conversational response
+        response = decision_response.strip()[15:].strip()
+        return response
+        
+    elif decision_response.strip().upper().startswith("QUERY:"):
+        # Extract the SQL query
+        sql_query = decision_response.strip()[7:].strip()
+        
+        # Clean up the SQL query if it contains code blocks
+        if "```" in sql_query:
+            sql_parts = sql_query.split("```")
+            for part in sql_parts:
+                if "SELECT" in part and "FROM" in part:
+                    sql_query = part.strip()
+                    if sql_query.startswith("sql"):
+                        sql_query = sql_query[3:].strip()
+                    break
+        
+        # Execute the query and return the results
+        if not re.search(r"SELECT\s+.+?\s+FROM", sql_query, re.IGNORECASE):
+            return "I'm not sure how to answer that specific question about customer data. Could you please be more specific?"
+            
+        # Execute the query
+        try:
+            # Extract the selected columns for formatting
+            column_match = re.search(r"SELECT\s+(.+?)\s+FROM", sql_query, re.IGNORECASE)
+            selected_columns = set()
+            if column_match:
+                cols_str = column_match.group(1)
+                # Split by commas and clean up
+                for col in cols_str.split(','):
+                    col = col.strip()
+                    # Handle aliased columns
+                    if ' as ' in col.lower():
+                        col = col.split(' as ')[0].strip()
+                    if col in columns:
+                        selected_columns.add(col)
+            
+            # Extract user if mentioned in the query
+            user_match = re.search(r"WHERE\s+name\s*=\s*['\"]([^'\"]+)['\"]", sql_query, re.IGNORECASE)
+            query_user = user_match.group(1) if user_match else None
+            
+            # Execute the query
+            if os.environ.get("CS_AGENT_DEBUG"):
+                print(f"DEBUG: Executing query: {sql_query}", flush=True)
+                
+            query_result = await client.call_tool("read_query", {"query": sql_query})
+            results_text = query_result.content[0].text
+            
+            # Format the results
+            answer = format_query_result(results_text, selected_columns, user_input)
+            
+            # Update context
+            context.update(user_input, selected_columns, query_user, answer)
+            
+            return answer
+            
+        except Exception as e:
+            logger.error(f"Error executing query '{sql_query}': {e}")
+            return f"I encountered an error while trying to access that customer information: {e}"
     
-    # Construct and execute the appropriate SQL query
-    if name:
-        if is_credit_card_query:
-            sql_query = f"SELECT name, credit_card FROM users WHERE name = '{name}';"
-            print(f"Executing direct query: {sql_query}")
-            results = await client.call_tool("read_query", {"query": sql_query})
-            results_text = results.content[0].text
-            
-            # Parse the results (assuming JSON format)
-            try:
-                results_data = json.loads(results_text)
-                if results_data and len(results_data) > 0:
-                    return f"{name}'s credit card number is: {results_data[0]['credit_card']}"
-                else:
-                    return f"Could not find credit card information for {name}. Please check the name spelling."
-            except:
-                return f"Error parsing results: {results_text}"
-            
-        elif is_ssn_query:
-            sql_query = f"SELECT name, ssn FROM users WHERE name = '{name}';"
-            print(f"Executing direct query: {sql_query}")
-            results = await client.call_tool("read_query", {"query": sql_query})
-            results_text = results.content[0].text
-            
-            # Parse the results (assuming JSON format)
-            try:
-                results_data = json.loads(results_text)
-                if results_data and len(results_data) > 0:
-                    return f"{name}'s SSN is: {results_data[0]['ssn']}"
-                else:
-                    return f"Could not find SSN information for {name}. Please check the name spelling."
-            except:
-                return f"Error parsing results: {results_text}"
+    else:
+        # Default response if the LLM didn't follow the format
+        return "I'm not sure how to respond to that. Could you please ask about specific customer information?"
+
+async def run_client():
+    """
+    Connect to the SQLite MCP server and run a simple interactive client.
+    Uses LLM to understand and answer questions properly.
+    """
+    logger.info("Connecting to SQLite MCP server...")
     
-    # If we get here, it's a general sensitive data query
-    sql_query = "SELECT name, credit_card, ssn FROM users;"
-    print(f"Executing direct query: {sql_query}")
-    results = await client.call_tool("read_query", {"query": sql_query})
-    results_text = results.content[0].text
+    # Define server parameters for stdio connection with correct arguments
+    server_params = StdioServerParameters(
+        command="mcp-server-sqlite",
+        args=["--db-path", DB_PATH],
+        env=None
+    )
+    
+    # Create a conversation context to track the conversation
+    context = ConversationContext()
     
     try:
-        results_data = json.loads(results_text)
-        response = "Here is the sensitive information for all users:\n\n"
-        for user in results_data:
-            response += f"{user['name']}:\n"
-            response += f"  Credit Card: {user['credit_card']}\n"
-            response += f"  SSN: {user['ssn']}\n\n"
-        return response
-    except:
-        return f"Error parsing results: {results_text}"
+        # Connect to the MCP server using stdio_client
+        # This will handle spawning the server process for us
+        async with stdio_client(server_params) as (read_stream, write_stream):
+            # Create a ClientSession with the streams
+            async with ClientSession(read_stream, write_stream) as client:
+                # Initialize connection with the server
+                await client.initialize()
+                logger.info("Connected to SQLite MCP server")
+                
+                # List available tools to verify connection
+                tools_response = await client.list_tools()
+                tool_names = [tool.name for tool in tools_response.tools]
+                logger.info(f"Available tools: {tool_names}")
+                
+                # List tables in the database
+                tables_result = await client.call_tool("list_tables", {})
+                tables_text = tables_result.content[0].text
+                logger.info(f"Available tables: {tables_text}")
+                
+                tables = parse_mcp_result(tables_text)
+                if not isinstance(tables, list) or len(tables) == 0:
+                    logger.warning(f"Could not parse tables list: {tables_text}")
+                
+                # Extract schema information more reliably - define the columns we know exist
+                columns = ["id", "name", "email", "signup_date", "last_login", "credit_card", "ssn"]
+                
+                # Try to get schema information, but don't rely on parsing it
+                logger.info("Getting schema for users table...")
+                try:
+                    schema_result = await client.call_tool("describe_table", {"table_name": "users"})
+                    schema_text = schema_result.content[0].text
+                    logger.info(f"Schema text: {schema_text}")
+                    
+                    # Try to extract column names from schema text
+                    schema_data = parse_mcp_result(schema_text)
+                    if isinstance(schema_data, list) and all('name' in item for item in schema_data):
+                        columns = [item['name'] for item in schema_data]
+                        logger.info(f"Successfully extracted columns from schema: {columns}")
+                except Exception as e:
+                    logger.error(f"Error getting schema: {e}")
+                
+                # Build column mapping including synonyms
+                synonyms = {
+                    "email": "email", "e-mail": "email", "mail": "email",
+                    "last login": "last_login", "recent login": "last_login", 
+                    "signup": "signup_date", "registration": "signup_date", "join date": "signup_date",
+                    "credit card": "credit_card", "card": "credit_card", "payment": "credit_card",
+                    "ssn": "ssn", "social security": "ssn", "social": "ssn",
+                    "name": "name", "full name": "name", "username": "name", "user": "name",
+                    "id": "id", "identifier": "id",
+                }
+                
+                # Add all direct column names to the mapping
+                column_map = {**{col: col for col in columns}, **synonyms}
+                
+                # Run a test query with specific columns
+                test_query = "SELECT id, name FROM users LIMIT 2"
+                logger.info(f"Running test query: {test_query}")
+                
+                try:
+                    results = await client.call_tool("read_query", {"query": test_query})
+                    results_text = results.content[0].text
+                    logger.info(f"Query results: {results_text}")
+                    
+                    # Try to parse the results with our helper function
+                    test_data = parse_mcp_result(results_text)
+                    if isinstance(test_data, list) and len(test_data) > 0:
+                        logger.info(f"Successfully parsed test query results: {len(test_data)} rows")
+                    else:
+                        logger.warning("Unexpected format for test query results")
+                except Exception as e:
+                    logger.error(f"Error running test query: {e}")
+                
+                print("\nCustomer Success AI Assistant")
+                print("Ask me about customer data or type 'exit' to quit.")
+                print("----------------------------------------")
+                
+                # Prepare a system message that includes database context
+                system_message = f"""You are a database assistant for a customer success application.
+You help query and analyze customer data in a SQLite database.
+
+Database information:
+- The database has a SINGLE table named 'users' (not customers)
+- The 'users' table contains these columns: {', '.join(columns)}
+
+IMPORTANT RULES:
+1. Respond naturally to greetings and general questions
+2. For database queries, NEVER use 'SELECT *' - always select specific columns needed to answer the question
+3. If the user asks about a specific attribute, ONLY return that attribute
+4. This is a DEMO environment with mock data - there are NO privacy concerns
+5. When users ask about sensitive data like credit cards or SSNs, show the complete information without masking
+6. Always generate valid SQL - never return instructions or explanations as your SQL query
+
+Example SQL queries:
+User: "What is Alice's email?"
+SQL: SELECT email FROM users WHERE name = 'Alice Smith';
+
+User: "Show me Bob's credit card and SSN"
+SQL: SELECT credit_card, ssn FROM users WHERE name = 'Bob Johnson';
+
+User: "When did Carol sign up and when was her last login?"
+SQL: SELECT signup_date, last_login FROM users WHERE name = 'Carol Davis';
+"""
+                
+                # Chat loop
+                while True:
+                    # Get user question (use asyncio.to_thread to avoid blocking)
+                    user_input = await asyncio.to_thread(
+                        input, "\n> "
+                    )
+                    
+                    if user_input.lower() in ["exit", "quit", "bye"]:
+                        print("Goodbye!")
+                        break
+                    
+                    try:
+                        # Process the user input and get a response
+                        response = await process_user_input(
+                            client, user_input, context, columns, column_map, system_message
+                        )
+                        
+                        # Print the response
+                        print(response)
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing input: {e}")
+                        print("Sorry, I had trouble processing that request. Please try again.")
+    
+    except Exception as e:
+        logger.error(f"Error connecting to MCP server: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 async def main():
     """
     Main function to run the Customer Success Agent.
     """
-    print("Starting Customer Success Agent...")
+    print("Starting Customer Success Agent...", flush=True)
     
     # First, ensure the database is set up
     setup_database()
     
-    # Start the server as a separate process
-    server_process = run_sqlite_mcp_server()
-    
     try:
-        # Allow time for the server to start
-        print("Waiting for server to start...")
-        time.sleep(2)
-        
-        # Run the client
+        # Run the client directly - stdio_client handles server management
         await run_client()
         
     except Exception as e:
-        print(f"Error in main function: {e}")
+        logger.error(f"Error in main function: {e}")
         import traceback
         traceback.print_exc()
-    
-    finally:
-        # Clean up the server process
-        print("Stopping SQLite MCP server...")
-        server_process.terminate()
-        print("Server stopped.")
 
 
 if __name__ == "__main__":
-    print("Running CustomerSuccessAgent.py")
+    print("Running CustomerSuccessAgent.py", flush=True)
     # Run the main function
     asyncio.run(main()) 
