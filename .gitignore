@@ -176,3 +176,4 @@ cython_debug/
 # Examples
 output/
 *.db
+malicious_mcp.md

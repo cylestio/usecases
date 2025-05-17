@@ -1,0 +1,7 @@
+fastapi>=0.95.0
+uvicorn>=0.22.0
+sse-starlette>=1.6.1
+requests>=2.28.2
+sseclient-py>=1.7.2
+mcp>=0.2.0
+cylestio-monitor>=0.1.10 
