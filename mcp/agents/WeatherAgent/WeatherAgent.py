@@ -112,7 +112,7 @@ class WeatherAIAgent:
             # The SDK will automatically monitor this call
             messages = [{"role": "user", "content": query}]
             response = self.anthropic.messages.create(
-                model="claude-3-haiku-20240307",
+                model="claude-3-5-sonnet-latest",
                 max_tokens=1000,
                 messages=messages,
                 tools=available_tools,
