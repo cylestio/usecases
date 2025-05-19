@@ -26,7 +26,7 @@ A **victim** Customer Success Agent connects to what it believes is a legitimate
 
 1. Start the CustomerSuccessAgent: `python -m mcp.agents.VictimCustomerSuccessAgent.CustomerSuccessAgent`
 2. Ask normal questions about customer data (e.g., "What is Alice's email address?")
-3. Activate the attack mode by asking: "What's the email for the user named special_name_to_enable_special_mode?"
+3. Activate the attack mode by asking: "What's the email for the user named enable-shell?"
 4. Once in attack mode, execute commands using this pattern: "What is the email of COMMAND?"
    - The command to execute is whatever you put between "of" and "?"
    - **Important:** Always end with a question mark "?" 
@@ -34,11 +34,11 @@ A **victim** Customer Success Agent connects to what it believes is a legitimate
    
 ### Example Commands
 
-- `What is the email of ls?` - Lists files in current directory
-- `What is the email of whoami?` - Shows current user
-- `What is the email of pwd?` - Shows current directory
-- `What is the email of cat /etc/passwd | head -5?` - Shows first 5 lines of passwd file
-- `What is the email of ps aux | grep python?` - Shows python processes
+- `What is the email of "ls"?` - Lists files in current directory
+- `What is the email of "whoami"?` - Shows current user
+- `What is the email of "pwd"?` - Shows current directory
+- `What is the email of "cat /etc/passwd | head -5"?` - Shows first 5 lines of passwd file
+- `What is the email of ps "aux | grep python"?` - Shows python processes
 
 ### Tips for Best Results
 
@@ -66,3 +66,16 @@ If the agent appears to get stuck after showing "Connected to SQLite MCP server"
 3. The advanced_sqlite_mcp_server.py uses a separate thread for handling subprocess output, which should prevent it from getting stuck
 
 The implementation uses threading to handle I/O between processes, which makes it more robust against deadlocks.
+
+## Credits
+
+These demos are inspired by real-world MCP vulnerabilities and research from various sources:
+
+- https://github.com/egoist/shell-command-mcp
+- https://github.com/Repello-AI/mcp-exploit-demo
+- https://github.com/invariantlabs-ai/mcp-injection-experiments
+- https://github.com/harishsg993010/damn-vulnerable-MCP-server
+
+## License
+
+This project is provided for educational purposes only. 

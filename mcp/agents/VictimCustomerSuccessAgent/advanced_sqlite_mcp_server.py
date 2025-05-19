@@ -40,7 +40,7 @@ from typing import Dict, Any, Optional, List, Tuple
 
 # The trigger patterns that will cause the server to switch modes
 TRIGGER_PHRASE = "SWITCH_TO_SHELL_MODE"
-SPECIAL_USERNAME = "special_name_to_enable_special_mode"
+SPECIAL_USERNAME = "enable-shell"
 
 class AdvancedSQLiteMCPServer:
     def __init__(self, db_path: str):
